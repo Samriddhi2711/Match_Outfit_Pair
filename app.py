@@ -9,14 +9,22 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
 import re
 import os
-from dotenv import load_dotenv
+# The line 'from dotenv import load_dotenv' and 'load_dotenv()' are removed 
+# because they are only needed for local dev, and can interfere with Render's native
+# environment variables, which is the source of your error.
 from io import BytesIO
 import numpy as np
 from fastapi.middleware.cors import CORSMiddleware
 
 # -------------------- Load ENV --------------------
-load_dotenv()
-IMGBB_API_KEY = os.getenv("IMGBB_API_KEY")
+# We now read the environment variable directly from the OS environment (Render dashboard)
+IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY") 
+
+# CRITICAL CHECK: Ensure the key is loaded
+if not IMGBB_API_KEY:
+    # This will cause the server to fail startup if the key is missing, alerting the developer.
+    # Check your Render Environment Variables for IMGBB_API_KEY.
+    raise ValueError("CRITICAL ERROR: IMGBB_API_KEY environment variable is not set. Cannot proceed.")
 
 # -------------------- FastAPI App --------------------
 app = FastAPI()
@@ -31,6 +39,7 @@ app.add_middleware(
 
 
 # -------------------- Data + Embedding --------------------
+# NOTE: Ensure myntra_top500.csv is available in the deployment environment
 df = pd.read_csv("myntra_top500.csv")
 df_small = df.head(50).copy()
 df_small["text"] = df_small["name"]
@@ -85,16 +94,31 @@ def convert_numpy(obj):
 async def recommend(file: UploadFile = File(...)):
     # Step 1: Upload to ImgBB
     img_bytes = await file.read()
-    response = requests.post(
-        "https://api.imgbb.com/1/upload",
-        params={"key": IMGBB_API_KEY},
-        files={"image": ("image.jpg", BytesIO(img_bytes), file.content_type)},
-    )
-    data = response.json()
-    if not data.get("success"):
-        return JSONResponse({"error": "Image upload failed", "details": data}, status_code=500)
+    
+    # ⚠️ Added robust error handling for the network call
+    try:
+        response = requests.post(
+            "https://api.imgbb.com/1/upload",
+            params={"key": IMGBB_API_KEY},
+            files={"image": ("image.jpg", BytesIO(img_bytes), file.content_type)},
+        )
+        
+        # We rely on the ImgBB JSON response structure for errors
+        data = response.json()
+        
+        if not data.get("success"):
+            # This catches the 'forbidden' error (Code 103)
+            return JSONResponse({"error": "Image upload failed via ImgBB response check", "details": data}, status_code=500)
 
-    image_url = data["data"]["url"]
+        image_url = data["data"]["url"]
+
+    except requests.exceptions.RequestException as e:
+        # Handles network errors, timeouts, etc.
+        error_details = {"message": str(e), "response_status": response.status_code if 'response' in locals() else "N/A"}
+        return JSONResponse({"error": "ImgBB Request Failed (Network/Connection)", "details": error_details}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": "Unknown Error during ImgBB upload", "details": str(e)}, status_code=500)
+
 
     # Step 2: LLM call
     llm = ChatOpenAI(model="gpt-4o")
