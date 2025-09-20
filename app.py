@@ -140,7 +140,7 @@ async def recommend(file: UploadFile = File(...)):
 
     if given == "top":
         if bottom_query:
-            for r in fetch_matching_products(bottom_query, top_k=1, filter_type="bottom"):
+            for r in fetch_matching_products(bottom_query, top_k=2, filter_type="bottom"):
                 suggestions["recommendations"]["bottom"].append({
                     "name": r["name"],
                     "price": convert_numpy(r["price"]),
@@ -149,7 +149,7 @@ async def recommend(file: UploadFile = File(...)):
                     "image": r["img"]
                 })
         if accessory_query:
-            for r in fetch_matching_products(accessory_query, top_k=1, filter_type="accessory"):
+            for r in fetch_matching_products(accessory_query, top_k=2, filter_type="accessory"):
                 suggestions["recommendations"]["accessory"].append({
                     "name": r["name"],
                     "price": convert_numpy(r["price"]),
@@ -160,7 +160,7 @@ async def recommend(file: UploadFile = File(...)):
 
     elif given == "bottom":
         if top_query:
-            for r in fetch_matching_products(top_query, top_k=1, filter_type="top"):
+            for r in fetch_matching_products(top_query, top_k=2, filter_type="top"):
                 suggestions["recommendations"]["top"].append({
                     "name": r["name"],
                     "price": convert_numpy(r["price"]),
@@ -169,7 +169,7 @@ async def recommend(file: UploadFile = File(...)):
                     "image": r["img"]
                 })
         if accessory_query:
-            for r in fetch_matching_products(accessory_query, top_k=1, filter_type="accessory"):
+            for r in fetch_matching_products(accessory_query, top_k=2, filter_type="accessory"):
                 suggestions["recommendations"]["accessory"].append({
                     "name": r["name"],
                     "price": convert_numpy(r["price"]),
@@ -180,7 +180,7 @@ async def recommend(file: UploadFile = File(...)):
 
     elif given == "accessory":
         if top_query:
-            for r in fetch_matching_products(top_query, top_k=1, filter_type="top"):
+            for r in fetch_matching_products(top_query, top_k=2, filter_type="top"):
                 suggestions["recommendations"]["top"].append({
                     "name": r["name"],
                     "price": convert_numpy(r["price"]),
@@ -189,7 +189,7 @@ async def recommend(file: UploadFile = File(...)):
                     "image": r["img"]
                 })
         if bottom_query:
-            for r in fetch_matching_products(bottom_query, top_k=1, filter_type="bottom"):
+            for r in fetch_matching_products(bottom_query, top_k=2, filter_type="bottom"):
                 suggestions["recommendations"]["bottom"].append({
                     "name": r["name"],
                     "price": convert_numpy(r["price"]),
