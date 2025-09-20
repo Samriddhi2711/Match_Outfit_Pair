@@ -1,6 +1,5 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
-from fastapi.encoders import jsonable_encoder
 import requests
 import pandas as pd
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -17,33 +16,47 @@ from fastapi.middleware.cors import CORSMiddleware
 # -------------------- Load ENV --------------------
 load_dotenv()
 IMGBB_API_KEY = os.getenv("IMGBB_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # -------------------- FastAPI App --------------------
-app = FastAPI()
+app = FastAPI(title="Weather-aware Outfit Recommender")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ya specific domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# -------------------- Root Route --------------------
+@app.get("/")
+async def root():
+    return {"message": "API is running. Use /recommend with POST to get outfit suggestions."}
 
-# -------------------- Data + Embedding --------------------
-df = pd.read_csv("myntra_top500.csv")
-df_small = df.head(50).copy()
-df_small["text"] = df_small["name"]
+# -------------------- Load Data + Embeddings --------------------
+try:
+    df = pd.read_csv("myntra_top500.csv")
+    df_small = df.head(50).copy()
+    df_small["text"] = df_small["name"]
 
-embeddings = OpenAIEmbeddings()
-docs = [Document(page_content=row["text"], metadata={"row": idx}) for idx, row in df_small.iterrows()]
-vectorstore = FAISS.from_documents(docs, embeddings)
+    embeddings = OpenAIEmbeddings()
+    docs = [Document(page_content=row["text"], metadata={"row": idx}) for idx, row in df_small.iterrows()]
+    vectorstore = FAISS.from_documents(docs, embeddings)
+except Exception as e:
+    print("Error loading CSV or embeddings:", e)
+    df_small = pd.DataFrame()
+    vectorstore = None
 
+# -------------------- Keywords --------------------
 top_keywords = ["top", "shirt", "t-shirt", "kurta", "blouse"]
 bottom_keywords = ["jeans", "trouser", "pant", "skirt", "shorts"]
 accessory_keywords = ["watch", "belt", "cap", "bag", "scarf", "beanie", "necklace"]
 
+# -------------------- Helper Functions --------------------
 def fetch_matching_products(query, top_k=1, filter_type=None):
+    if vectorstore is None or df_small.empty:
+        return []
     docs_and_scores = vectorstore.similarity_search_with_score(query, k=top_k*2)
     results = []
     for doc, score in docs_and_scores:
@@ -62,7 +75,6 @@ def fetch_matching_products(query, top_k=1, filter_type=None):
             break
     return results
 
-# -------------------- Helper: Convert numpy/pandas to Python native --------------------
 def convert_numpy(obj):
     if isinstance(obj, (np.integer,)):
         return int(obj)
@@ -83,120 +95,132 @@ def convert_numpy(obj):
 # -------------------- API Route --------------------
 @app.post("/recommend")
 async def recommend(file: UploadFile = File(...)):
-    # Step 1: Upload to ImgBB
-    img_bytes = await file.read()
-    response = requests.post(
-        "https://api.imgbb.com/1/upload",
-        params={"key": IMGBB_API_KEY},
-        files={"image": ("image.jpg", BytesIO(img_bytes), file.content_type)},
-    )
-    data = response.json()
-    if not data.get("success"):
-        return JSONResponse({"error": "Image upload failed", "details": data}, status_code=500)
+    try:
+        # 1️⃣ Check API keys
+        if not IMGBB_API_KEY:
+            return JSONResponse({"error": "IMGBB_API_KEY not set"}, status_code=500)
+        if not OPENAI_API_KEY:
+            return JSONResponse({"error": "OPENAI_API_KEY not set"}, status_code=500)
 
-    image_url = data["data"]["url"]
+        # 2️⃣ Upload image to ImgBB
+        img_bytes = await file.read()
+        try:
+            response = requests.post(
+                "https://api.imgbb.com/1/upload",
+                params={"key": IMGBB_API_KEY},
+                files={"image": ("image.jpg", BytesIO(img_bytes), file.content_type)},
+            )
+            data = response.json()
+        except Exception as e:
+            return JSONResponse({"error": "ImgBB upload failed", "details": str(e)}, status_code=500)
 
-    # Step 2: LLM call
-    llm = ChatOpenAI(model="gpt-4o")
+        if not data.get("success"):
+            return JSONResponse({"error": "Image upload failed", "details": data}, status_code=500)
 
-    prompt_text = (
-        "Given the image of a clothing item, identify if it is a top, bottom wear, or accessory. "
-        "Then, suggest the other two categories with real product names (not invented) that would match well. "
-        "Format:\n"
-        "Given: [top/bottom wear/accessory]\n"
-        "Bottom Wear: [suggestion]\n"
-        "Top: [suggestion]\n"
-        "Accessory: [suggestion]\n"
-    )
+        image_url = data["data"]["url"]
 
-    message = [
-        {"type": "text", "text": prompt_text},
-        {"type": "image_url", "image_url": {"url": image_url}},
-    ]
+        # 3️⃣ Call LLM
+        llm = ChatOpenAI(model="gpt-4o")
+        prompt_text = (
+            "Given the image of a clothing item, identify if it is a top, bottom wear, or accessory. "
+            "Then, suggest the other two categories with real product names (not invented) that would match well. "
+            "Format:\n"
+            "Given: [top/bottom wear/accessory]\n"
+            "Bottom Wear: [suggestion]\n"
+            "Top: [suggestion]\n"
+            "Accessory: [suggestion]\n"
+        )
+        message = [
+            {"type": "text", "text": prompt_text},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+        try:
+            result = llm.invoke([HumanMessage(content=message)])
+        except Exception as e:
+            return JSONResponse({"error": "LLM call failed", "details": str(e)}, status_code=500)
 
-    result = llm.invoke([HumanMessage(content=message)])
+        # 4️⃣ Parse LLM output
+        given_match = re.search(r"Given:\s*(\w+)", result.content, re.IGNORECASE)
+        bottom_match = re.search(r"Bottom Wear:\s*(.*)", result.content, re.IGNORECASE)
+        top_match = re.search(r"Top:\s*(.*)", result.content, re.IGNORECASE)
+        accessory_match = re.search(r"Accessory:\s*(.*)", result.content, re.IGNORECASE)
 
-    # Step 3: Parse output
-    given_match = re.search(r"Given:\s*(\w+)", result.content, re.IGNORECASE)
-    bottom_match = re.search(r"Bottom Wear:\s*(.*)", result.content, re.IGNORECASE)
-    top_match = re.search(r"Top:\s*(.*)", result.content, re.IGNORECASE)
-    accessory_match = re.search(r"Accessory:\s*(.*)", result.content, re.IGNORECASE)
+        given = given_match.group(1).strip().lower() if given_match else ""
+        bottom_query = bottom_match.group(1).strip() if bottom_match else ""
+        top_query = top_match.group(1).strip() if top_match else ""
+        accessory_query = accessory_match.group(1).strip() if accessory_match else ""
 
-    given = given_match.group(1).strip().lower() if given_match else ""
-    bottom_query = bottom_match.group(1).strip() if bottom_match else ""
-    top_query = top_match.group(1).strip() if top_match else ""
-    accessory_query = accessory_match.group(1).strip() if accessory_match else ""
-
-    # Step 4: Prepare JSON
-    suggestions = {
-        "uploaded_image": image_url,
-        "given_category": given,
-        "recommendations": {
-            "top": [],
-            "bottom": [],
-            "accessory": []
+        # 5️⃣ Prepare suggestions JSON
+        suggestions = {
+            "uploaded_image": image_url,
+            "given_category": given,
+            "recommendations": {"top": [], "bottom": [], "accessory": []}
         }
-    }
 
-    if given == "top":
-        if bottom_query:
-            for r in fetch_matching_products(bottom_query, top_k=1, filter_type="bottom"):
-                suggestions["recommendations"]["bottom"].append({
-                    "name": r["name"],
-                    "price": convert_numpy(r["price"]),
-                    "discount": convert_numpy(r["discount"]),
-                    "url": r["purl"],
-                    "image": r["img"]
-                })
-        if accessory_query:
-            for r in fetch_matching_products(accessory_query, top_k=1, filter_type="accessory"):
-                suggestions["recommendations"]["accessory"].append({
-                    "name": r["name"],
-                    "price": convert_numpy(r["price"]),
-                    "discount": convert_numpy(r["discount"]),
-                    "url": r["purl"],
-                    "image": r["img"]
-                })
+        # 6️⃣ Fetch recommendations
+        try:
+            if given == "top":
+                if bottom_query:
+                    for r in fetch_matching_products(bottom_query, top_k=1, filter_type="bottom"):
+                        suggestions["recommendations"]["bottom"].append({
+                            "name": r["name"],
+                            "price": convert_numpy(r["price"]),
+                            "discount": convert_numpy(r["discount"]),
+                            "url": r["purl"],
+                            "image": r["img"]
+                        })
+                if accessory_query:
+                    for r in fetch_matching_products(accessory_query, top_k=1, filter_type="accessory"):
+                        suggestions["recommendations"]["accessory"].append({
+                            "name": r["name"],
+                            "price": convert_numpy(r["price"]),
+                            "discount": convert_numpy(r["discount"]),
+                            "url": r["purl"],
+                            "image": r["img"]
+                        })
+            elif given == "bottom":
+                if top_query:
+                    for r in fetch_matching_products(top_query, top_k=1, filter_type="top"):
+                        suggestions["recommendations"]["top"].append({
+                            "name": r["name"],
+                            "price": convert_numpy(r["price"]),
+                            "discount": convert_numpy(r["discount"]),
+                            "url": r["purl"],
+                            "image": r["img"]
+                        })
+                if accessory_query:
+                    for r in fetch_matching_products(accessory_query, top_k=1, filter_type="accessory"):
+                        suggestions["recommendations"]["accessory"].append({
+                            "name": r["name"],
+                            "price": convert_numpy(r["price"]),
+                            "discount": convert_numpy(r["discount"]),
+                            "url": r["purl"],
+                            "image": r["img"]
+                        })
+            elif given == "accessory":
+                if top_query:
+                    for r in fetch_matching_products(top_query, top_k=1, filter_type="top"):
+                        suggestions["recommendations"]["top"].append({
+                            "name": r["name"],
+                            "price": convert_numpy(r["price"]),
+                            "discount": convert_numpy(r["discount"]),
+                            "url": r["purl"],
+                            "image": r["img"]
+                        })
+                if bottom_query:
+                    for r in fetch_matching_products(bottom_query, top_k=1, filter_type="bottom"):
+                        suggestions["recommendations"]["bottom"].append({
+                            "name": r["name"],
+                            "price": convert_numpy(r["price"]),
+                            "discount": convert_numpy(r["discount"]),
+                            "url": r["purl"],
+                            "image": r["img"]
+                        })
+        except Exception as e:
+            return JSONResponse({"error": "Recommendation fetching failed", "details": str(e)}, status_code=500)
 
-    elif given == "bottom":
-        if top_query:
-            for r in fetch_matching_products(top_query, top_k=1, filter_type="top"):
-                suggestions["recommendations"]["top"].append({
-                    "name": r["name"],
-                    "price": convert_numpy(r["price"]),
-                    "discount": convert_numpy(r["discount"]),
-                    "url": r["purl"],
-                    "image": r["img"]
-                })
-        if accessory_query:
-            for r in fetch_matching_products(accessory_query, top_k=1, filter_type="accessory"):
-                suggestions["recommendations"]["accessory"].append({
-                    "name": r["name"],
-                    "price": convert_numpy(r["price"]),
-                    "discount": convert_numpy(r["discount"]),
-                    "url": r["purl"],
-                    "image": r["img"]
-                })
+        # 7️⃣ Return final JSON
+        return JSONResponse(content=convert_numpy(suggestions))
 
-    elif given == "accessory":
-        if top_query:
-            for r in fetch_matching_products(top_query, top_k=1, filter_type="top"):
-                suggestions["recommendations"]["top"].append({
-                    "name": r["name"],
-                    "price": convert_numpy(r["price"]),
-                    "discount": convert_numpy(r["discount"]),
-                    "url": r["purl"],
-                    "image": r["img"]
-                })
-        if bottom_query:
-            for r in fetch_matching_products(bottom_query, top_k=1, filter_type="bottom"):
-                suggestions["recommendations"]["bottom"].append({
-                    "name": r["name"],
-                    "price": convert_numpy(r["price"]),
-                    "discount": convert_numpy(r["discount"]),
-                    "url": r["purl"],
-                    "image": r["img"]
-                })
-
-    # ✅ Ensure JSON safe
-    return JSONResponse(content=convert_numpy(suggestions))
+    except Exception as e:
+        return JSONResponse({"error": "Unexpected error", "details": str(e)}, status_code=500)
